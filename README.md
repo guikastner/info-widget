@@ -39,7 +39,7 @@ npm run build
 
 ### Deploy para MinIO (apenas compilados)
 
-Requer o MinIO Client (`mc`) instalado e disponível no `PATH`.
+Agora o deploy usa o SDK Node oficial do MinIO (não precisa do binário `mc`).
 
 1. Defina as variáveis de ambiente (exemplos abaixo):
 
@@ -54,13 +54,30 @@ $env:MINIO_ALIAS = "minio"               # nome do alias no mc
 $env:MINIO_REMOVE_EXTRA = "1"            # remove arquivos que não existem mais em dist/
 ```
 
-2. Rode o deploy (build + sync do `dist/`):
+2. Instale dependências (se ainda não):
+
+```sh
+npm install
+```
+
+3. Rode o deploy (build + upload do `dist/`):
 
 ```sh
 npm run builddeploy
 ```
 
-O script em `scripts/deploy-minio.js` (Node) chama o `mc mirror --overwrite` para sincronizar apenas os artefatos compilados do diretório `dist/` para o destino `minio/bucket/prefix`.
+O script `scripts/deploy-minio.js` conecta no endpoint do MinIO e:
+- Garante a existência do bucket (`makeBucket` se necessário)
+- Remove arquivos remotos extras se `MINIO_REMOVE_EXTRA=1`
+- Faz upload dos arquivos do `dist/` (mantendo a estrutura de pastas), respeitando o `MINIO_PREFIX` se definido
+
+Variáveis suportadas no `.env`:
+- `MINIO_URL` (ex.: `http://localhost:9000`)
+- `MINIO_ACCESS_KEY` e `MINIO_SECRET_KEY`
+- `MINIO_BUCKET`
+- `MINIO_PREFIX` (opcional, subpasta)
+- `MINIO_REGION` (opcional)
+- `MINIO_REMOVE_EXTRA=1` (opcional)
 
 ### Lint with [ESLint](https://eslint.org/)
 

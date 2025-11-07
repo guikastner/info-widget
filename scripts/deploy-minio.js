@@ -1,38 +1,17 @@
-// Node deploy script for MinIO using MinIO Client (mc)
-// Requires: mc available in PATH
+// Node deploy script for MinIO using MinIO SDK (no external mc binary)
 
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs'
+import { resolve, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const SOURCE_DIR = process.env.SOURCE_DIR || 'dist'
 
-function log(msg, color = '36') { // 36 = cyan
-  // simple ANSI coloring; CLI may strip if unsupported
+function log(msg, color = '36') {
   console.log(`\x1b[${color}m==> ${msg}\x1b[0m`)
 }
 
 function error(msg) {
   console.error(`\x1b[31m${msg}\x1b[0m`)
-}
-
-function run(cmd, args, opts = {}) {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { stdio: 'inherit', shell: false, ...opts })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) resolvePromise(undefined)
-      else reject(new Error(`${cmd} exited with code ${code}`))
-    })
-  })
-}
-
-function tryFindMc() {
-  return new Promise((resolvePromise) => {
-    const child = spawn('mc', ['--version'], { stdio: 'ignore', shell: false })
-    child.on('error', () => resolvePromise(false))
-    child.on('close', (code) => resolvePromise(code === 0))
-  })
 }
 
 function loadDotEnv() {
@@ -65,54 +44,130 @@ function requireEnv(keys) {
 }
 
 async function main() {
-  log(`Deploy para MinIO a partir de '${SOURCE_DIR}'`)
+  log(`Deploy para MinIO (SDK) a partir de '${SOURCE_DIR}'`)
 
   // Load .env if present
   loadDotEnv()
-
-  // Verify mc availability
-  if (!(await tryFindMc())) {
-    error("MinIO Client 'mc' não encontrado no PATH.")
-    console.log('Instale o mc ou adicione ao PATH: https://min.io/docs/minio/linux/reference/minio-mc.html')
-    process.exit(1)
-  }
 
   // Validate env
   requireEnv(['MINIO_URL', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'MINIO_BUCKET'])
 
   // Validate source directory
-  if (!existsSync(resolve(process.cwd(), SOURCE_DIR))) {
+  const absSource = resolve(process.cwd(), SOURCE_DIR)
+  if (!existsSync(absSource)) {
     error(`Diretório de origem não encontrado: ${SOURCE_DIR}. Rode o build antes (npm run build).`)
     process.exit(1)
   }
 
-  const alias = (process.env.MINIO_ALIAS && process.env.MINIO_ALIAS.trim()) || 'minio'
-  const url = process.env.MINIO_URL
-  const access = process.env.MINIO_ACCESS_KEY
-  const secret = process.env.MINIO_SECRET_KEY
+  const url = new URL(process.env.MINIO_URL)
+  const useSSL = url.protocol === 'https:'
+  const endPoint = url.hostname
+  const port = url.port ? Number(url.port) : useSSL ? 443 : 80
+  const accessKey = process.env.MINIO_ACCESS_KEY
+  const secretKey = process.env.MINIO_SECRET_KEY
   const bucket = process.env.MINIO_BUCKET
   const prefix = (process.env.MINIO_PREFIX || '').replace(/^\/+|\/+$/g, '')
+  const region = process.env.MINIO_REGION || undefined
   const removeExtra = process.env.MINIO_REMOVE_EXTRA === '1'
 
-  log(`Configurando alias '${alias}' -> ${url}`)
-  await run('mc', ['alias', 'set', alias, url, access, secret])
+  const { Client } = await import('minio')
+  const client = new Client({ endPoint, port, useSSL, accessKey, secretKey, region })
 
-  log(`Criando bucket (se necessário): ${bucket}`)
-  await run('mc', ['mb', '--ignore-existing', `${alias}/${bucket}`])
+  // Ensure bucket exists
+  log(`Verificando bucket: ${bucket}`)
+  let exists
+  try {
+    exists = await client.bucketExists(bucket)
+  } catch (e) {
+    const msg = e?.message || String(e)
+    error(`Falha ao verificar bucket '${bucket}': ${msg}`)
+    if (/API port/i.test(msg)) {
+      console.log('Dica: a variável MINIO_URL deve apontar para a porta da API S3 (ex.: http://host:9000), não a porta do Console (ex.: 9001).')
+    }
+    process.exit(1)
+  }
+  if (!exists) {
+    log(`Criando bucket: ${bucket}`)
+    try {
+      await client.makeBucket(bucket, region)
+    } catch (e) {
+      const msg = e?.message || String(e)
+      error(`Falha ao criar bucket '${bucket}': ${msg}`)
+      if (/API port/i.test(msg)) {
+        console.log('Dica: use o endpoint da API S3 (ex.: http://host:9000) em MINIO_URL, não o Console (ex.: 9001).')
+      }
+      process.exit(1)
+    }
+  }
 
-  const dest = prefix ? `${alias}/${bucket}/${prefix}` : `${alias}/${bucket}`
-  log(`Espelhando '${SOURCE_DIR}' -> '${dest}'`)
+  // Walk local files
+  function walk(dir, base, acc = []) {
+    const entries = readdirSync(dir)
+    for (const name of entries) {
+      const full = resolve(dir, name)
+      const st = statSync(full)
+      if (st.isDirectory()) {
+        walk(full, base, acc)
+      } else if (st.isFile()) {
+        const rel = relative(base, full).split('\\').join('/')
+        acc.push({ full, rel })
+      }
+    }
+    return acc
+  }
 
-  const mirrorArgs = ['mirror', '--overwrite']
-  if (removeExtra) mirrorArgs.push('--remove')
-  mirrorArgs.push(SOURCE_DIR, dest)
+  const files = walk(absSource, absSource)
+  const localSet = new Set(files.map(({ rel }) => (prefix ? `${prefix}/${rel}` : rel)))
 
-  await run('mc', mirrorArgs)
-  log('Deploy concluído com sucesso.', '32') // green
+  // Optionally remove remote extras
+  if (removeExtra) {
+    log('Listando objetos remotos para limpeza...')
+    await new Promise((resolvePromise, reject) => {
+      const toDelete = []
+      const stream = client.listObjectsV2(bucket, prefix || '', true)
+      stream.on('data', (obj) => {
+        if (obj?.name && !localSet.has(obj.name)) toDelete.push(obj.name)
+      })
+      stream.on('error', reject)
+      stream.on('end', async () => {
+        if (toDelete.length === 0) return resolvePromise()
+        log(`Removendo ${toDelete.length} objeto(s) que não existem em '${SOURCE_DIR}'`)
+        // Delete em lotes pequenos
+        const chunk = 1000
+        for (let i = 0; i < toDelete.length; i += chunk) {
+          const batch = toDelete.slice(i, i + chunk).map((name) => ({ name }))
+          await client.removeObjects(bucket, batch)
+        }
+        resolvePromise()
+      })
+    })
+  }
+
+  // Upload files
+  log(`Enviando ${files.length} arquivo(s) para '${bucket}/${prefix || ''}'`)
+
+  const mime = (name) => {
+    const lower = name.toLowerCase()
+    if (lower.endsWith('.html')) return 'text/html'
+    if (lower.endsWith('.js')) return 'application/javascript'
+    if (lower.endsWith('.css')) return 'text/css'
+    if (lower.endsWith('.json')) return 'application/json'
+    if (lower.endsWith('.svg')) return 'image/svg+xml'
+    if (lower.endsWith('.png')) return 'image/png'
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+    if (lower.endsWith('.ico')) return 'image/x-icon'
+    return 'application/octet-stream'
+  }
+
+  for (const { full, rel } of files) {
+    const objectName = prefix ? `${prefix}/${rel}` : rel
+    await client.fPutObject(bucket, objectName, full, { 'Content-Type': mime(rel) })
+  }
+
+  log('Deploy concluído com sucesso.', '32')
 }
 
 main().catch((e) => {
   error(e?.message || String(e))
   process.exit(1)
 })
-
